@@ -11,7 +11,7 @@ export default defineConfig({
   testDir: '.',
   testMatch: 'projects/**/test-plans/**/*.spec.ts',
   fullyParallel: false,
-  workers: 1,
+  workers: 3,
   retries: 0,
   timeout: 90_000,
   expect: { timeout: 10_000 },

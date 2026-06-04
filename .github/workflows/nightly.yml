@@ -1,13 +1,12 @@
 name: Nightly tests
 run-name: Nightly run · ${{ github.event_name }}
 
-# Runs every local spec under projects/*/test-plans/**/*.spec.ts, writes a
-# per-plan markdown report into projects/<name>/test-reports/<YYYY-MM-DD>/,
-# rebuilds the hub dashboards and commits everything back in a single push.
+# Discovers every project that has specs, runs each project in a parallel matrix job,
+# uploads per-project reports as artifacts, then a final commit job collects them all,
+# rebuilds the hub dashboards, and pushes a single commit.
 on:
   schedule:
     # 00:00 UTC = 02:00 SAST every night.
-    # Times are always UTC; scheduled workflows only fire on the default branch.
     - cron: "0 0 * * *"
   workflow_dispatch: {}
 
@@ -15,9 +14,38 @@ permissions:
   contents: write
 
 jobs:
-  nightly:
+  # ── 1. Discover which projects have specs ────────────────────────────────────
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      has_specs: ${{ steps.set-matrix.outputs.has_specs }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: set-matrix
+        run: |
+          PROJECTS=$(find projects -name '*.spec.ts' -path '*/test-plans/*' 2>/dev/null \
+            | sed 's|projects/\([^/]*\)/.*|\1|' | sort -u)
+          if [ -z "$PROJECTS" ]; then
+            echo 'matrix={"project":[]}' >> $GITHUB_OUTPUT
+            echo 'has_specs=false' >> $GITHUB_OUTPUT
+            echo "::warning::No specs found under projects/*/test-plans/. Nothing to run."
+          else
+            MATRIX=$(printf '%s\n' $PROJECTS | jq -R -s -c '{project:(split("\n")|map(select(.!="")))}')
+            echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+            echo 'has_specs=true' >> $GITHUB_OUTPUT
+          fi
+
+  # ── 2. Run one job per project in parallel ───────────────────────────────────
+  test:
+    needs: discover
+    if: needs.discover.outputs.has_specs == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
 
@@ -37,7 +65,8 @@ jobs:
           import { defineConfig } from '@playwright/test';
           export default defineConfig({
             testDir: '.',
-            workers: 1,
+            fullyParallel: true,
+            workers: 3,
             timeout: 90_000,
             reporter: [
               ['list'],
@@ -53,7 +82,7 @@ jobs:
           });
           EOF
 
-      - name: Run every local spec
+      - name: Run specs for ${{ matrix.project }}
         run: |
           set +e
           TODAY=$(date -u +%Y-%m-%d)
@@ -61,20 +90,23 @@ jobs:
           PASS=0
           FAIL=0
           ROWS=""
+          PROJECT="${{ matrix.project }}"
+          PROJ_DIR="projects/$PROJECT"
 
-          mapfile -t SPECS < <(find projects -name '*.spec.ts' -path '*/test-plans/*' | sort)
+          # Clean stale allure results so each nightly run starts with a fresh slate
+          rm -rf "$PROJ_DIR/allure-results"
+
+          mapfile -t SPECS < <(find "$PROJ_DIR" -name '*.spec.ts' -path '*/test-plans/*' | sort)
           if [ ${#SPECS[@]} -eq 0 ]; then
-            echo "::warning::No specs found under projects/*/test-plans/. Nothing to run."
+            echo "::warning::No specs found for project $PROJECT. Nothing to run."
             exit 0
           fi
 
           for SPEC in "${SPECS[@]}"; do
             REL=${SPEC#projects/}
-            PROJECT=${REL%%/*}
             REST=${REL#$PROJECT/}
             PLAN=${REST%.spec.ts}.md
             PLAN_BASE=$(basename "$PLAN" .md)
-            PROJ_DIR="projects/$PROJECT"
 
             echo "::group::$PROJECT / $PLAN"
             rm -rf ci-results
@@ -108,17 +140,58 @@ jobs:
               echo "_Triggered by the nightly schedule._"
             } > "$PROJ_DIR/test-reports/$TODAY/$PLAN_BASE.md"
 
-            ROWS="${ROWS}- ${RESULT} · \`${PROJECT}\` / \`${PLAN}\` (${DURATION:-?})\n"
+            ROWS="${ROWS}- ${RESULT} · \`${PROJECT}\` / \`${PLAN_BASE}\` (${DURATION:-?})\n"
             echo "::endgroup::"
           done
 
           {
-            echo "## Nightly summary — $TODAY"
+            echo "## $PROJECT — $TODAY"
             echo ""
             echo "**Passed:** $PASS · **Failed:** $FAIL · **Total:** ${#SPECS[@]}"
             echo ""
             echo -e "$ROWS"
           } >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-${{ matrix.project }}
+          path: projects/${{ matrix.project }}/test-reports/
+          if-no-files-found: ignore
+
+  # ── 3. Collect reports, rebuild dashboards, commit ───────────────────────────
+  commit:
+    needs: [discover, test]
+    if: always() && needs.discover.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install hub dependencies
+        run: npm install --no-save --no-package-lock
+
+      - name: Download test reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: reports-*
+          merge-multiple: false
+          path: downloaded-reports/
+        continue-on-error: true
+
+      - name: Place reports into project directories
+        run: |
+          for dir in downloaded-reports/reports-*/; do
+            [ -d "$dir" ] || continue
+            PROJECT="${dir#downloaded-reports/reports-}"
+            PROJECT="${PROJECT%/}"
+            mkdir -p "projects/$PROJECT/test-reports"
+            cp -r "$dir/." "projects/$PROJECT/test-reports/"
+          done
 
       - name: Rebuild hub dashboards
         if: always()
