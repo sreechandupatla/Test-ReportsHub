@@ -43,6 +43,9 @@ Before executing ANY test plan:
 | Role | Username | Password |
 |------|----------|----------|
 | Admin | admin | P@ssw0rd |
+| Employee | 12345678 | 123qwe |
+| Supervisor | GOV012 | 123qwe |
+| HR Verifier | MaletshaN | 123qwe |
 
 ## Azure DevOps
 | Key | Value |
